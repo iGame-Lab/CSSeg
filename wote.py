@@ -1,0 +1,436 @@
+import numpy as np
+from tqdm import tqdm
+from MedSAM.segment_anything import sam_model_registry
+from MedSAM.demo import BboxPromptDemo
+import os
+import argparse
+from CAM.main_vit import show_mask, dice_coeff
+from Utils import *
+import logging
+import time
+from CAM.utils import scoremap2bbox
+from skimage import measure
+import multiprocessing
+
+
+
+def scale_cam_image(cam, target_size=None):
+    result = []
+    for img in cam:
+        img = img - np.min(img)
+        img = img / (1e-7 + np.max(img))
+        if target_size is not None:
+            img = cv2.resize(img, target_size)
+        result.append(img)
+    result = np.float32(result)
+
+    return result
+
+
+def preprossess(img, mask):
+    for i in range(img.shape[0]):
+        for j in range(img.shape[1]):
+            if (img[i][j] <= 1e-9):
+                mask[i][j] = 0
+    return mask
+
+
+def find_max_eras(mask):
+    # 图像读取
+    img = mask
+    img = np.array(img)
+    img[img != 0] = 1  # 图像二值化
+    # 图像实例化
+    img = measure.label(img, connectivity=2)
+    props = measure.regionprops(img)
+    # 最大区域获取
+    max_area = 0
+    max_index = 0
+    # props只包含像素值不为零区域的属性，因此index要从1开始
+    for index, prop in enumerate(props, start=1):
+        if prop.area > max_area:
+            max_area = prop.area
+            # index 代表每个联通区域内的像素值；prop.area代表相应连通区域内的像素个数
+            max_index = index
+    if max_index == 0:
+        return img
+    img[img != max_index] = 0
+    img[img == max_index] = 1
+
+    return img
+
+
+def show_mask_image(mask, ax, random_color=False, alpha=0.95):
+    if random_color:
+        color = np.concatenate([np.random.random(3), np.array([alpha])], axis=0)
+    else:
+        color = np.array([251 / 255, 252 / 255, 30 / 255, alpha])
+    h, w = mask.shape[-2:]
+    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+    ax.imshow(mask_image)
+
+
+def main(opt, logger):
+    n_jobs = multiprocessing.cpu_count()
+    device = "cuda:0"
+    # CAM模型导入
+    MedSAM_CKPT_PATH = "C:/Users/Administrator/Desktop/MedSAM-main/work_dir/MedSAM/medsam_vit_b.pth"
+    medsam_model = sam_model_registry['vit_b'](checkpoint=MedSAM_CKPT_PATH)
+    medsam_model = medsam_model.to(device)
+    medsam_model.eval()
+    # 初始化dice
+    dice_caa = 0
+    dice_sam_caa = 0
+    dice_out = 0
+    dice_in = 0
+    pic_out_len = 0
+    pic_in_len = 0
+
+    # 初始化MedSAM
+    bbox_prompt_demo = BboxPromptDemo(medsam_model)
+    # 获得视频列表
+    video_path = build_video_list(opt.video_dir)
+    cnt = 0
+
+    for video_dir in tqdm(video_path, desc="Processing Videos"):  # 遍历所以的视频
+
+        video_name = video_dir.split('\\')[-1]
+
+
+        video_output_path = os.path.join(opt.video_out_path, video_dir.split('\\')[-1])
+        if not os.path.exists(video_output_path):
+            os.makedirs(video_output_path)
+        cam_list = []
+        label_res_list = []
+        cam_box_list = []
+        SAM_list = []
+        cam_box_dice = []
+        cam_dice = []
+        sam2_dice = []
+        label_dice = []
+        #保存SAM_stack
+        SAM_stack=[]
+        # 保存全部的box框
+        box_list = []
+        # 保存原始cam热力图
+        cam_ori_mask = []
+        cam_stack_mask = np.zeros((240, 240))
+        # 保存处理后的cam热力图
+        cam_pro_mask = []
+        cam_pro_stack_mask = np.zeros((240, 240))
+        #保存sam处理图
+        sam_pro_mask=[]
+        # 保存box圈主的区域
+        box_mask = []
+        box_stack_mask = np.zeros((240, 240))
+        # 保存label叠加
+        label_mask = []
+        label_stack_mask = np.zeros((240, 240))
+        # 得到视频全部图片帧
+        frame_names, frame = build_frame_list(video_dir)
+        cam_path = opt.cam_dir
+        label_path = opt.label_path
+        # 得到视频全部图片的label
+        label = build_label_list(label_path, frame_names)
+
+        # 得到视频全部图片的cam热力图
+        for img_name, label_data in zip(frame_names, label):
+            cnt += 1
+            img_data = np.load(os.path.join(opt.img_path, img_name.split('.')[0] + '.npz'))["arr_0"]
+            grad_cam = np.load(os.path.join(opt.out_path, img_name.split('.')[0] + '.npz'))['original_cam']
+            caa_grad_cam = np.load(os.path.join(opt.out_path, img_name.split('.')[0] + '.npz'))['caa_cam']
+            sam_mask = np.load(os.path.join("F:/brats/box_stack_sam1_stack/best",img_name.split('.')[0] + '.npz'))['caa_sam1_stack_pred']
+            sam_pro_mask.append(sam_mask)
+            # 保存原始的cam_mask
+            cam_ori_mask.append(caa_grad_cam.copy())
+            temp = []
+            for _ in range(3):
+                temp.append(img_data)
+            tmpimage = np.array(temp)
+            tmpimage = tmpimage.transpose(1, 2, 0)
+            original_grad_cam = np.array(caa_grad_cam).copy()
+            original_grad_cam[original_grad_cam < 0.8] = 0
+            original_grad_cam[grad_cam < 0.2] = 0
+            caa_grad_cam = preprossess(img_data, caa_grad_cam)
+
+            caa_grad_cam[caa_grad_cam < 0.8*caa_grad_cam.max()] = 0
+            caa_grad_cam[caa_grad_cam >= 0.8*caa_grad_cam.max()] = 1
+            caa_grad_cam[grad_cam < 0.2] = 0
+
+            caa_grad_cam = find_max_eras(caa_grad_cam)
+            # 保存处理后的cam_mask
+            cam_pro_mask.append(caa_grad_cam.copy())
+
+            boxcaa, cntcaa = scoremap2bbox(scoremap=caa_grad_cam, threshold=0.4, multi_contour_eval=True)
+            # 保存box圈主的区域
+            zero_array = np.zeros_like(caa_grad_cam)
+            # 使用box的坐标，圈住的区域内赋值为1
+            x1, y1, x2, y2 = boxcaa[0]
+            tempbox = []
+            tempbox.append(boxcaa[0])
+            # box_list.append(boxcaa[0])
+            zero_array[y1:y2 + 1, x1:x2 + 1] = 1
+            for j_ in range(1, cntcaa):
+                x1, y1, x2, y2 = boxcaa[j_]
+                tempbox.append(boxcaa[j_])
+                zero_array[y1:y2 + 1, x1:x2 + 1] = 1
+            box_list.append(np.array(tempbox))
+            box_mask.append(zero_array)
+            label_mask.append(label_data)
+
+        SAM_MASK=sam_pro_mask.copy()
+
+        label_stack_mask = normalize_sum_of_arrays(label_mask)
+        cam_stack_mask = normalize_sum_of_arrays(cam_ori_mask)
+        cam_pro_stack_mask = normalize_sum_of_arrays(cam_pro_mask)
+        sam_pro_mask = normalize_sum_of_arrays(sam_pro_mask)
+        SAM_MASK = normalize_sum_of_arrays(SAM_MASK)
+
+        if not os.path.exists(os.path.join(video_output_path, "STACK")):
+            os.makedirs(os.path.join(video_output_path, "STACK"))
+        img_uint8 = np.uint8(255 * np.clip(show_cam_on_image(tmpimage,cam_pro_stack_mask,returncam=True,use_rgb=False), 0, 1))
+        cv2.imwrite(os.path.join(video_output_path, "STACK","cam_stack.png"), img_uint8)
+
+        img_uint8 = np.uint8(255 * np.clip(show_cam_on_image(tmpimage,label_stack_mask,returncam=True,use_rgb=False), 0, 1))
+        cv2.imwrite(os.path.join(video_output_path,"STACK", "label_stack.png"), img_uint8)
+
+
+        original_cam_pro_stack_mask = cam_pro_stack_mask.copy()
+        maxvalue = original_cam_pro_stack_mask.max()
+        original_cam_pro_stack_mask[original_cam_pro_stack_mask == maxvalue] = 1
+        original_cam_pro_stack_mask[original_cam_pro_stack_mask != maxvalue] = 0
+
+        cam_pro_stack_mask[cam_pro_stack_mask >= 0.2] = 1
+        cam_pro_stack_mask[cam_pro_stack_mask < 0.2] = 0
+        boxsum, cntsum = scoremap2bbox(scoremap=cam_pro_stack_mask, threshold=0.4, multi_contour_eval=True)
+
+        original_sam_stack_mask=sam_pro_mask.copy()
+        maxvalue = original_sam_stack_mask.max()
+        original_sam_stack_mask[original_sam_stack_mask != maxvalue] = 0
+        original_sam_stack_mask[original_sam_stack_mask==maxvalue]=1
+
+        sam_pro_mask[sam_pro_mask > 0] = 1
+        sam_pro_mask[sam_pro_mask <= 0] = 0
+        # boxsum, cntsum = scoremap2bbox(scoremap=sam_pro_mask, threshold=0.4, multi_contour_eval=True)
+
+        SAM_MASK[SAM_MASK>0.2]=1
+        SAM_MASK[SAM_MASK<=0.2]=0
+        SAM_MASK = find_max_eras(SAM_MASK)
+
+        for index in np.arange(len(box_list)):
+            cam_ori=cam_ori_mask[index].copy()
+            maxvalue = cam_ori.max()
+            cam_ori[cam_ori != maxvalue] = 0
+            cam_ori[cam_ori == maxvalue] = 1
+            if index ==0:  # 确保不是最后一个元素
+                if not np.any(np.logical_and(cam_ori == 1, cam_pro_stack_mask == 1)):
+                    box_list[index] = box_list[index + 1]  # 将当前的 box 替换为下一个 box 的值
+                    cam_ori_mask[index]=cam_ori_mask[index+1]
+            else:
+                if not np.any(np.logical_and(cam_ori == 1, cam_pro_stack_mask == 1)):
+                    box_list[index] = box_list[index - 1]
+                    cam_ori_mask[index] = cam_ori_mask[index - 1]
+
+
+        for index in np.arange(len(box_list) - 1, -1, -1):  # 从最后一个元素开始反向遍历
+            cam_ori=cam_ori_mask[index].copy()
+            maxvalue = cam_ori.max()
+            cam_ori[cam_ori != maxvalue] = 0
+            cam_ori[cam_ori == maxvalue] = 1
+            if index != len(box_list) - 1:  # 确保不是最后一个元素
+                if not np.any(np.logical_and(cam_ori == 1, cam_pro_stack_mask == 1)):
+                    box_list[index] = box_list[index + 1]  # 将当前的 box 替换为下一个 box 的值
+                    cam_ori_mask[index] = cam_ori_mask[index + 1]
+            else:
+                if not np.any(np.logical_and(cam_ori == 1, cam_pro_stack_mask == 1)):
+                    box_list[index] = box_list[index - 1]
+                    cam_ori_mask[index] = cam_ori_mask[index - 1]
+
+
+        # 将全部图片的框与最佳框进行取交集
+        for i, box in enumerate(box_list):
+            box_list_res = []
+            for one_box in box:
+                for sum_box in boxsum:
+                    tmpbox = get_intersection(one_box, sum_box)
+                    if tmpbox is not None:
+                        box_list_res.append(tmpbox)
+            if len(box_list_res) != 0:
+                box_list[i] = np.array(box_list_res)
+            else:
+                if i == 0:
+                    box_list[i] = box_list[i + 1]
+                else:
+                    box_list[i] = box_list[i - 1]
+        box_list = fill_none_with_nearest(box_list)
+
+        for index in np.arange(0, len(box_list)):
+            if index != 0:
+                box = box_list[index]
+                zero_array = np.zeros_like(original_cam_pro_stack_mask)
+                for j_ in range(0, len(box)):
+                    x1, y1, x2, y2 = box[j_]
+                    zero_array[y1:y2 + 1, x1:x2 + 1] = 1
+                if compute_iou(zero_array,original_cam_pro_stack_mask) ==0:
+                    box_list[index] = box_list[index - 1]
+            else :
+                box = box_list[index]
+                zero_array = np.zeros_like(original_cam_pro_stack_mask)
+                for j_ in range(0, len(box)):
+                    x1, y1, x2, y2 = box[j_]
+                    zero_array[y1:y2 + 1, x1:x2 + 1] = 1
+                if compute_iou(zero_array, original_cam_pro_stack_mask) == 0:
+                    box_list[index] = box_list[index + 1]
+
+        for index in np.arange(len(box_list) - 1, -1, -1):  # 从最后一个元素开始反向遍历
+            if index != len(box_list) - 1:  # 确保不是最后一个元素
+                box = box_list[index]
+                zero_array = np.zeros_like(original_cam_pro_stack_mask)
+                for j_ in range(0, len(box)):
+                    x1, y1, x2, y2 = box[j_]
+                    zero_array[y1:y2 + 1, x1:x2 + 1] = 1
+                if compute_iou(zero_array, original_cam_pro_stack_mask) == 0:
+                    box_list[index] = box_list[index + 1]  # 将当前的 box 替换为下一个 box 的值
+            else:
+                box = box_list[index]
+                zero_array = np.zeros_like(original_cam_pro_stack_mask)
+                for j_ in range(0, len(box)):
+                    x1, y1, x2, y2 = box[j_]
+                    zero_array[y1:y2 + 1, x1:x2 + 1] = 1
+                if compute_iou(zero_array, original_cam_pro_stack_mask) == 0:
+                    box_list[index] = box_list[index - 1]  # 将最后一个元素替换为前一个元素的值
+
+        rescnt = -1
+        for img_name, label_data in zip(frame_names, label):
+            rescnt += 1
+            cam_dice.append(0)
+            img_data = np.load(os.path.join(opt.img_path, img_name.split('.')[0] + '.npz'))["arr_0"]
+            grad_cam = np.load(os.path.join(opt.out_path, img_name.split('.')[0] + '.npz'))['original_cam']
+            caa_grad_cam = np.load(os.path.join(opt.out_path, img_name.split('.')[0] + '.npz'))['caa_cam']
+            temp = []
+            for _ in range(3):
+                temp.append(img_data)
+            tmpimage = np.array(temp)
+            tmpimage = tmpimage.transpose(1, 2, 0)
+            cam_list.append(show_cam_on_image(tmpimage, caa_grad_cam, returncam=True))
+
+            original_grad_cam = np.array(caa_grad_cam).copy()
+
+            original_grad_cam[original_grad_cam < 0.8] = 0
+            original_grad_cam[grad_cam < 0.2] = 0
+            caa_grad_cam = preprossess(img_data, caa_grad_cam)
+            caa_grad_cam[caa_grad_cam < 0.8] = 0
+            caa_grad_cam[caa_grad_cam >= 0.8] = 1
+            caa_grad_cam[grad_cam < 0.2] = 0
+
+            caa_grad_cam = find_max_eras(caa_grad_cam)
+            zero_array = np.zeros_like(caa_grad_cam)
+            for j_ in box_list[rescnt]:
+                boxcaa = j_
+                x1, y1, x2, y2 = boxcaa
+                zero_array[y1:y2 + 1, x1:x2 + 1] = 1
+            caa_grad_cam[zero_array == 0] = 0
+
+            dice = dice_coeff(caa_grad_cam, label_data)
+            dice_caa += dice
+            cam_box_list.append(show_cam_on_image(tmpimage.copy(), caa_grad_cam, box=box_list[rescnt], returncam=True))
+            cam_box_dice.append(dice_coeff(caa_grad_cam, label_data))
+            label_res_list.append(show_cam_on_image(tmpimage.copy(), label_data, returncam=True))
+            label_dice.append(1)
+            SAM_mask_caa = bbox_prompt_demo.show(image_path=os.path.join(opt.img_path, img_name.split('.')[0] + '.npz'),
+                                                 Box=box_list[rescnt][0])
+            for j_ in range(1, len(box_list[rescnt])):
+                tmp_SAM_mask = bbox_prompt_demo.show(
+                    image_path=os.path.join(opt.img_path, img_name.split('.')[0] + '.npz'), Box=box_list[rescnt][j_])
+                SAM_mask_caa = SAM_mask_caa + tmp_SAM_mask
+            SAM_mask_caa[SAM_mask_caa > 0] = 1
+            dice_sam = dice_coeff(SAM_mask_caa, label_data)
+            SAM_stack.append(SAM_mask_caa)
+            dice_sam_caa += dice_sam
+            SAM_list.append(show_cam_on_image(tmpimage.copy(), SAM_mask_caa, returncam=True))
+            sam2_dice.append(dice_sam)
+            if dice_coeff(caa_grad_cam, label_data) >= 0.1:
+                dice_out += dice_sam
+                pic_out_len += 1
+            else:
+                dice_in += dice_sam
+
+                pic_in_len += 1
+            if not os.path.exists(opt.npz_dir):
+                os.makedirs(opt.npz_dir)
+
+            np.savez(os.path.join(opt.npz_dir, img_name.split('.')[0]),
+                     caa_sam1_stack_pred=SAM_mask_caa
+                     )
+
+        # 保存原始cam为视频。
+        save_images_as_video(cam_list, os.path.join(video_output_path, "原始cam.mp4"))
+        # 保存处理后cam+box视频
+        save_images_as_video(cam_box_list, os.path.join(video_output_path, "cam+box.mp4"))
+        # 保存label视频
+        save_images_as_video(label_res_list, os.path.join(video_output_path, "label.mp4"))
+        # 保存MedSAM为视频
+        save_images_as_video(SAM_list, os.path.join(video_output_path, "SAM.mp4"))
+        dice_list = np.array([cam_dice, cam_box_dice, label_dice, sam2_dice])
+        # merge_videos([
+        #     os.path.join(video_output_path, "原始cam.mp4"),
+        #     os.path.join(video_output_path, "cam+box.mp4"),
+        #     os.path.join(video_output_path, "label.mp4"),
+        #     os.path.join(video_output_path, "SAM.mp4")
+        # ], output_path=os.path.join(video_output_path, "combine.mp4"), titles=["原始cam", "cam+box", "label", "SAM1"],
+        #     dice=dice_list)
+        SAM_stack=normalize_sum_of_arrays(SAM_stack)
+
+        img_uint8 = np.uint8(255 * np.clip(show_cam_on_image(tmpimage,SAM_stack,returncam=True,use_rgb=False), 0, 1))
+        cv2.imwrite(os.path.join(video_output_path, "STACK","sam_stack.png"), img_uint8)
+
+        logging.info(f"{video_name}:dice_cam:{round(np.array(cam_box_dice).sum() / cam_box_dice.__len__(), 4)}"
+                     f"dice_sam:{round(np.array(sam2_dice).sum() / sam2_dice.__len__(), 4)},dice_cam_sum: {round(dice_caa / cnt, 4)} dice_sam_sum: {round(dice_sam_caa / cnt, 4)}"
+                     f"去掉0.1的dice：{round(dice_out / pic_out_len, 4)},只看0.1以下的dice：{round(dice_in / pic_in_len, 4)},数据集{pic_out_len}/{cnt}")
+
+
+def loadLogger(args):
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter(fmt="[ %(asctime)s ] %(message)s",
+                                  datefmt="%a %b %d %H:%M:%S %Y")
+
+    sHandler = logging.StreamHandler()
+    sHandler.setFormatter(formatter)
+
+    logger.addHandler(sHandler)
+
+    if not args.not_save:
+        work_dir = os.path.join(args.work_dir,
+                                time.strftime("%Y.%m.%dT%H %M %S", time.localtime()))
+        if not os.path.exists(work_dir):
+            os.makedirs(work_dir)
+
+        fHandler = logging.FileHandler(work_dir + '/log.txt', mode='w')
+        fHandler.setLevel(logging.DEBUG)
+        fHandler.setFormatter(formatter)
+
+        logger.addHandler(fHandler)
+
+    return logger
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--device', default='cuda:0', help='device id (i.e. 0 or 0,1 or cpu)')
+    parser.add_argument('--num_classes', type=int, default=2)
+    parser.add_argument('--img_path', default="F:/brats/val/yes")
+    parser.add_argument('--label_path', default="F:/brats/val/label")
+    parser.add_argument('--cam_dir', default="F:/brats/val/cam")
+    parser.add_argument('--video_dir', default="F:/brats/valyes")
+    parser.add_argument('--not-save', default=False, action='store_true',
+                        help='If yes, only output log to terminal.')
+    parser.add_argument('--work-dir', default='./work_dir',
+                        help='the work folder for storing results')
+    parser.add_argument('--out_path', default="F:/brats/val/cam")
+    parser.add_argument('--video_out_path', default="F:/brats/video_medsam_twosam_addcam_1012")
+    parser.add_argument('--sam1-dir', default="F:/brats/box_stack_sam1")
+    parser.add_argument('--npz-dir', default="F:/brats/box_stack_sam1_stack/twosam_addcam_1012")
+    opt = parser.parse_args()
+    logger = loadLogger(opt)
+    main(opt, logger)
